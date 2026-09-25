@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <title>tripleS Cosmo Tool · Transfer + SPIN</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">COSMO TOOL · tripleS ONLY</div>
+        <h1>tripleS Cosmo Tool</h1>
+        <p class="subtitle">Objekt 전송과 SPIN을 <strong>공식 흐름 그대로</strong> 안전하게 사용할 수 있도록 만든 로컬 도구입니다.</p>
+      </div>
+      <div class="top-actions">
+        <span id="bridgeBadge" class="status-badge pending">로컬 프로그램 연결 중</span>
+        <button id="logoutBtn" class="ghost hidden" type="button">로그아웃</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="loginView" class="login-wrap">
+        <article class="panel login-panel">
+          <div class="panel-head">
+            <div>
+              <span class="step-pill">1</span>
+              <h2>Cosmo 로그인</h2>
+            </div>
+            <span class="triple-badge">tripleS</span>
+          </div>
+
+          <label class="field-label" for="emailInput">Cosmo 가입 이메일</label>
+          <div class="input-row">
+            <input id="emailInput" type="email" autocomplete="email" placeholder="name@example.com" />
+            <button id="sendCodeBtn" class="secondary" type="button">인증번호 보내기</button>
+          </div>
+
+          <div id="codeArea" class="code-area hidden">
+            <label class="field-label" for="codeInput">이메일 인증번호</label>
+            <div class="input-row">
+              <input id="codeInput" inputmode="numeric" autocomplete="one-time-code" placeholder="인증번호 입력" />
+              <button id="loginBtn" class="primary" type="button">로그인</button>
+            </div>
+          </div>
+
+          <p id="loginStatus" class="status-text">인증번호를 받은 뒤 로그인하세요.</p>
+          <div class="security-note">
+            <strong>서명키는 파일이나 외부 서버에 저장하지 않습니다.</strong>
+            로그인과 전송은 이 PC에서 실행되는 로컬 프로그램이 직접 처리하며, 전송용 키는 실행 중 메모리에서만 사용합니다.
+          </div>
+        </article>
+      </section>
+
+      <section id="mainView" class="hidden">
+        <div class="mode-tabs panel" role="tablist" aria-label="기능 선택">
+          <button id="transferTabBtn" class="mode-tab active" type="button" role="tab">전송</button>
+          <button id="spinTabBtn" class="mode-tab" type="button" role="tab">SPIN</button>
+        </div>
+        <div class="account-strip">
+          <div>
+            <span class="muted">로그인 계정</span>
+            <strong id="accountName">-</strong>
+          </div>
+          <div class="account-address-wrap">
+            <span class="muted">Wallet</span>
+            <code id="accountAddress">-</code>
+          </div>
+          <button id="refreshBtn" class="ghost" type="button">Objekt 새로고침</button>
+        </div>
+
+        <div id="transferWorkspace" class="workspace">
+          <section class="library-column">
+            <div class="toolbar panel">
+              <div class="toolbar-title">
+                <div>
+                  <span class="step-pill">2</span>
+                  <h2>보낼 시리얼 선택</h2>
+                </div>
+                <span id="libraryCount" class="count-label">0 collections</span>
+              </div>
+              <div class="filters">
+                <input id="cardSearch" type="search" placeholder="멤버 / 301 / 시즌 검색" />
+                <select id="memberFilter"><option value="">모든 멤버</option></select>
+                <select id="seasonFilter"><option value="">모든 시즌</option></select>
+                <label class="toggle-row">
+                  <input id="transferableOnly" type="checkbox" checked />
+                  <span>전송 가능 카드만</span>
+                </label>
+              </div>
+            </div>
+
+            <div id="loadingLibrary" class="empty-state hidden">Objekt를 불러오는 중입니다…</div>
+            <div id="emptyLibrary" class="empty-state hidden">조건에 맞는 Objekt가 없습니다.</div>
+            <div id="collectionGrid" class="collection-grid"></div>
+          </section>
+
+          <aside class="send-column">
+            <div class="send-panel panel">
+              <div class="send-head">
+                <div>
+                  <span class="step-pill">3</span>
+                  <h2>전송 준비</h2>
+                </div>
+                <span id="selectedCount" class="selected-badge">0장</span>
+              </div>
+
+              <div id="selectedSummary" class="selected-summary empty-mini">시리얼을 선택하면 여기에 표시됩니다.</div>
+
+              <div class="recipient-block">
+                <label class="field-label" for="recipientInput">받는 Cosmo 닉네임</label>
+                <div class="input-row compact">
+                  <input id="recipientInput" type="search" autocomplete="off" placeholder="닉네임 검색" />
+                  <button id="recipientSearchBtn" class="secondary" type="button">검색</button>
+                </div>
+                <div id="recipientResults" class="recipient-results hidden"></div>
+                <div id="chosenRecipient" class="chosen-recipient hidden"></div>
+              </div>
+
+              <button id="reviewBtn" class="primary wide" type="button" disabled>전송 내용 확인</button>
+              <p class="tiny-note">전송은 동시에 여러 장을 쏘지 않고, 한 장의 실제 이동이 확인된 뒤 다음 장으로 진행합니다.</p>
+            </div>
+          </aside>
+        </div>
+
+
+        <section id="spinWorkspace" class="spin-workspace hidden">
+          <article class="panel spin-panel">
+            <div class="panel-head">
+              <div>
+                <span class="step-pill">SPIN</span>
+                <h2>Cosmo SPIN</h2>
+              </div>
+              <span id="spinSafetyBadge" class="status-badge pending">서버 상태 확인 중</span>
+            </div>
+
+            <div class="spin-stats">
+              <div class="spin-stat"><span>Spin Ticket</span><strong id="spinTicketCount">-</strong><small id="spinNextTicket">-</small></div>
+              <div class="spin-stat"><span>Point</span><strong id="spinPointBalance">-</strong><small id="spinPrice">SPIN 가격 -</small></div>
+            </div>
+
+            <div class="spin-mode-note">
+              <span>Ticket SPIN만 사용</span>
+              <span>자동 재시도 없음</span>
+              <span>서버 결과 16칸 그대로 표시</span>
+              <small>Point 결제 SPIN은 실행하지 않습니다.</small>
+            </div>
+
+            <div id="spinChooseView">
+              <div class="spin-toolbar">
+                <div>
+                  <h3>사용할 Objekt 선택</h3>
+                  <p class="tiny-note">SPIN 가능한 Objekt만 표시합니다. 사용할 실제 시리얼을 직접 선택하세요.</p>
+                </div>
+                <button id="spinRefreshBtn" class="ghost" type="button">SPIN 상태 새로고침</button>
+              </div>
+              <div class="filters spin-filters">
+                <input id="spinSearch" type="search" placeholder="멤버 / 301 / 시즌 검색" />
+                <select id="spinSeasonFilter"><option value="">모든 Spin 가능 시즌</option></select>
+              </div>
+              <div id="spinEmpty" class="empty-state hidden">현재 SPIN에 사용할 수 있는 Objekt가 없습니다.</div>
+              <div id="spinCollectionGrid" class="spin-collection-grid"></div>
+
+              <div id="spinSelectedBox" class="spin-selected-box hidden">
+                <div>
+                  <span class="muted">선택한 Objekt</span>
+                  <strong id="spinSelectedTitle">-</strong>
+                  <span id="spinSelectedSerial">-</span>
+                </div>
+                <button id="spinStartBtn" class="danger" type="button">이 시리얼로 SPIN 1회</button>
+              </div>
+            </div>
+
+            <div id="spinPickView" class="hidden">
+              <div class="spin-stage-head">
+                <div><h3>한 칸을 선택하세요</h3><p class="tiny-note">원하는 칸을 누르면 결과 요청을 한 번 전송하고, 응답이 오면 16칸 전체를 동시에 공개합니다.</p></div>
+                <span id="spinSessionLabel" class="count-label">SPIN</span>
+              </div>
+              <div id="spinPickGrid" class="spin-pick-grid"></div>
+            </div>
+
+            <div id="spinResultView" class="hidden">
+              <div class="spin-result-hero">
+                <span class="muted">이번 SPIN 결과</span>
+                <strong id="spinResultTitle">-</strong>
+                <span id="spinResultSub">-</span>
+              </div>
+              <div class="spin-stage-head">
+                <div><h3>이번 SPIN 전체 후보</h3><p class="tiny-note">내가 고른 칸과 실제 획득 Objekt를 함께 표시하고, 나머지 후보도 한 화면에서 전부 보여줍니다.</p></div>
+              </div>
+              <div id="spinResultGrid" class="spin-result-grid"></div>
+              <button id="spinNextBtn" class="primary wide" type="button">다음 SPIN 준비</button>
+            </div>
+          </article>
+        </section>      </section>
+    </main>
+  </div>
+
+  <div id="confirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <div class="modal-card confirm-card">
+      <div class="modal-head">
+        <div>
+          <div class="eyebrow">FINAL CHECK</div>
+          <h2 id="confirmTitle">정확히 이 시리얼을 보냅니다</h2>
+        </div>
+        <button class="icon-btn" data-close="confirmModal" aria-label="닫기">×</button>
+      </div>
+      <div id="confirmRecipient" class="confirm-recipient"></div>
+      <div id="confirmList" class="confirm-list"></div>
+      <div class="warning-box">전송된 Objekt는 자동으로 되돌릴 수 없습니다. 닉네임과 시리얼을 다시 확인해 주세요.</div>
+      <div class="modal-actions">
+        <button class="ghost" data-close="confirmModal" type="button">돌아가기</button>
+        <button id="startTransferBtn" class="danger" type="button">선택한 Objekt 전송 시작</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="progressModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="progressTitle">
+    <div class="modal-card progress-card">
+      <div class="modal-head">
+        <div>
+          <div class="eyebrow">SEQUENTIAL TRANSFER</div>
+          <h2 id="progressTitle">전송 진행 중</h2>
+        </div>
+      </div>
+      <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+      <div id="progressMeta" class="progress-meta">0 / 0</div>
+      <div id="progressRows" class="progress-rows"></div>
+      <div id="progressFooter" class="modal-actions hidden">
+        <button id="progressCloseBtn" class="primary wide" type="button">확인</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

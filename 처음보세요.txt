@@ -1,0 +1,13 @@
+tripleS Cosmo Tool v4 + SPIN
+
+1) START.bat 더블클릭
+2) Cosmo 이메일 인증 로그인
+3) 위쪽 전송 / SPIN 탭 선택
+
+SPIN은 자동 연속 기능이 없습니다.
+매번 실제 시리얼을 직접 선택하고, 16칸도 직접 하나 고릅니다.
+
+이번 버전의 SPIN 결제는 Spin Ticket만 지원합니다.
+Point 잔액/600P 가격은 서버에서 읽어 표시만 합니다.
+
+이제 아이폰 WireGuard/캡처 도구는 필요 없습니다.

@@ -1,0 +1,8 @@
+/cosmo-tui
+/cosmo-tripleS
+/cosmo-artms
+/cosmo-idntt
+/dist/
+*.exe
+/auth.json
+.DS_Store
