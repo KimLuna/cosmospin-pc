@@ -27,3 +27,4 @@ Safety choices: ticket-only SPIN, no automatic repeat, no automatic choice, no r
 - 고정 3.5초/8초 대기 제거
 - SPIN 화면 UI 정리
 # cosmospin-pc
+# cosmospin-pc
