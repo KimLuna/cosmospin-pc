@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	"codeberg.org/djvu/cosmo-tui/internal/chain"
@@ -25,16 +24,6 @@ import (
 )
 
 const currentObjektContract = "0x99Bb83AE9bb0C0A6be865CaCF67760947f91Cb70"
-
-var (
-	stateMu        sync.RWMutex
-	transferMu     sync.Mutex
-	spinMu         sync.Mutex
-	client         *cosmo.Client
-	signer         *wallet.Wallet
-	currentAccount *accountResult
-	pendingSpin    *spinSession
-)
 
 type accountResult struct {
 	Nickname string `json:"nickname"`
@@ -173,13 +162,11 @@ func withTimeout(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
 }
 
-func getSession() (*cosmo.Client, *wallet.Wallet, error) {
-	stateMu.RLock()
-	defer stateMu.RUnlock()
-	if client == nil || signer == nil {
+func getSession(s *userSession) (*cosmo.Client, *wallet.Wallet, error) {
+	if s == nil || s.client == nil || s.signer == nil {
 		return nil, nil, errors.New("먼저 Cosmo 계정에 로그인해 주세요")
 	}
-	return client, signer, nil
+	return s.client, s.signer, nil
 }
 
 func apiErrorDetail(prefix string, err error) error {
@@ -217,11 +204,11 @@ func sendCode(email string) (any, error) {
 	return map[string]bool{"ok": true}, nil
 }
 
-func loginCosmo(email, code string) (any, error) {
+func loginCosmo(email, code string) (*cosmo.Client, *wallet.Wallet, accountResult, error) {
 	email = strings.TrimSpace(email)
 	code = strings.TrimSpace(code)
 	if email == "" || code == "" {
-		return nil, errors.New("이메일과 인증번호를 모두 입력해 주세요")
+		return nil, nil, accountResult{}, errors.New("이메일과 인증번호를 모두 입력해 주세요")
 	}
 
 	ctx, cancel := withTimeout(120 * time.Second)
@@ -229,15 +216,15 @@ func loginCosmo(email, code string) (any, error) {
 
 	creds, privy, err := cosmo.Login(ctx, email, code)
 	if err != nil {
-		return nil, apiErrorDetail("로그인 실패", err)
+		return nil, nil, accountResult{}, apiErrorDetail("로그인 실패", err)
 	}
 	if strings.TrimSpace(privy.AccessToken) == "" || strings.TrimSpace(privy.EOA) == "" {
-		return nil, errors.New("Privy 지갑 정보를 확인하지 못했습니다")
+		return nil, nil, accountResult{}, errors.New("Privy 지갑 정보를 확인하지 못했습니다")
 	}
 
 	w, err := wallet.Provision(ctx, privy.AccessToken, privy.EOA)
 	if err != nil {
-		return nil, fmt.Errorf("전송용 지갑 준비 실패: %w", err)
+		return nil, nil, accountResult{}, fmt.Errorf("전송용 지갑 준비 실패: %w", err)
 	}
 	c := cosmo.New(creds, nil)
 
@@ -246,28 +233,24 @@ func loginCosmo(email, code string) (any, error) {
 		result.Nickname = p.Nickname
 		result.Address = p.Address
 	}
-
-	stateMu.Lock()
-	client = c
-	signer = w
-	accountCopy := result
-	currentAccount = &accountCopy
-	stateMu.Unlock()
-	return result, nil
+	return c, w, result, nil
 }
 
-func sessionInfo() (sessionDTO, error) {
-	stateMu.RLock()
-	defer stateMu.RUnlock()
-	if client == nil || signer == nil || currentAccount == nil {
-		return sessionDTO{Authenticated: false}, nil
+func sessionInfo(s *userSession) sessionDTO {
+	if s == nil {
+		return sessionDTO{Authenticated: false}
 	}
-	copy := *currentAccount
-	return sessionDTO{Authenticated: true, Account: &copy}, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client == nil || s.signer == nil || s.currentAccount == nil {
+		return sessionDTO{Authenticated: false}
+	}
+	account := *s.currentAccount
+	return sessionDTO{Authenticated: true, Account: &account}
 }
 
-func collections() (any, error) {
-	c, _, err := getSession()
+func collections(s *userSession) (any, error) {
+	c, _, err := getSession(s)
 	if err != nil {
 		return nil, err
 	}
@@ -312,8 +295,8 @@ func collections() (any, error) {
 	return out, nil
 }
 
-func searchUsers(query string) (any, error) {
-	c, _, err := getSession()
+func searchUsers(s *userSession, query string) (any, error) {
+	c, _, err := getSession(s)
 	if err != nil {
 		return nil, err
 	}
@@ -355,11 +338,14 @@ func resolveTokenContract(ctx context.Context, c *cosmo.Client, own cosmo.Objekt
 	return "", errors.New("현재 소유자와 일치하는 Objekt 계약을 확인하지 못했습니다. 전송을 중단했습니다")
 }
 
-func transfer(objektID int64, recipient string) (any, error) {
-	transferMu.Lock()
-	defer transferMu.Unlock()
+func transfer(s *userSession, objektID int64, recipient string) (any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return transferLocked(s, objektID, recipient)
+}
 
-	c, w, err := getSession()
+func transferLocked(s *userSession, objektID int64, recipient string) (any, error) {
+	c, w, err := getSession(s)
 	if err != nil {
 		return nil, err
 	}
@@ -504,8 +490,8 @@ func doCosmoRequest(ctx context.Context, c *cosmo.Client, method, path string, p
 	return nil
 }
 
-func spinStatus() (spinStatusDTO, error) {
-	c, _, err := getSession()
+func spinStatus(s *userSession) (spinStatusDTO, error) {
+	c, _, err := getSession(s)
 	if err != nil {
 		return spinStatusDTO{}, err
 	}
@@ -535,13 +521,13 @@ func spinStatus() (spinStatusDTO, error) {
 		}
 	}
 
-	spinMu.Lock()
+	s.mu.Lock()
 	var p *spinSession
-	if pendingSpin != nil {
-		copy := *pendingSpin
+	if s.pendingSpin != nil {
+		copy := *s.pendingSpin
 		p = &copy
 	}
-	spinMu.Unlock()
+	s.mu.Unlock()
 	return spinStatusDTO{
 		Tickets:          tickets.AvailableTicketsCount,
 		NextReceiveAt:    tickets.NextReceiveAt,
@@ -566,13 +552,13 @@ func resolveCosmoSpin(ctx context.Context, c *cosmo.Client) (string, error) {
 	return "", errors.New("공식 cosmo-spin 수신 계정을 확인하지 못했습니다. SPIN을 중단했습니다")
 }
 
-func spinStart(objektID int64) (any, error) {
-	spinMu.Lock()
-	defer spinMu.Unlock()
-	if pendingSpin != nil {
-		return nil, fmt.Errorf("이미 진행 중인 SPIN이 있습니다 (단계: %s). 중복 실행하지 않습니다", pendingSpin.Phase)
+func spinStart(s *userSession, objektID int64) (any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingSpin != nil {
+		return nil, fmt.Errorf("이미 진행 중인 SPIN이 있습니다 (단계: %s). 중복 실행하지 않습니다", s.pendingSpin.Phase)
 	}
-	c, _, err := getSession()
+	c, _, err := getSession(s)
 	if err != nil {
 		return nil, err
 	}
@@ -618,40 +604,40 @@ func spinStart(objektID int64) (any, error) {
 	if pre.SpinID <= 0 {
 		return nil, errors.New("SPIN ID를 받지 못해 중단했습니다")
 	}
-	pendingSpin = &spinSession{SpinID: pre.SpinID, ObjektID: objektID, Phase: "pre-signed"}
+	s.pendingSpin = &spinSession{SpinID: pre.SpinID, ObjektID: objektID, Phase: "pre-signed"}
 
-	trAny, err := transfer(objektID, spinRecipient)
+	trAny, err := transferLocked(s, objektID, spinRecipient)
 	if err != nil {
-		pendingSpin.Phase = "transfer-error"
+		s.pendingSpin.Phase = "transfer-error"
 		return nil, fmt.Errorf("SPIN용 Objekt 이동 단계에서 중단되었습니다. 자동 재시도하지 않습니다: %w", err)
 	}
 	tr := trAny.(transferResult)
-	pendingSpin.TransferHash = tr.Hash
-	pendingSpin.Phase = "transferred"
+	s.pendingSpin.TransferHash = tr.Hash
+	s.pendingSpin.Phase = "transferred"
 
 	ctxSpin, cancelSpin := withTimeout(30 * time.Second)
 	// Captured body length and the pre-sign response match the official {spinId} request shape.
 	err = doCosmoRequest(ctxSpin, c, http.MethodPost, "/bff/v3/spin", map[string]int64{"spinId": pre.SpinID}, true, nil)
 	cancelSpin()
 	if err != nil {
-		pendingSpin.Phase = "spin-request-error"
+		s.pendingSpin.Phase = "spin-request-error"
 		return nil, fmt.Errorf("Objekt는 이동했지만 SPIN 시작 요청 확인에 실패했습니다. 자동 재전송은 하지 않습니다: %w", err)
 	}
-	pendingSpin.Phase = "started"
-	pendingSpin.StartedAt = time.Now()
+	s.pendingSpin.Phase = "started"
+	s.pendingSpin.StartedAt = time.Now()
 	return spinStartResult{SpinID: pre.SpinID, ObjektID: objektID, TransferHash: tr.Hash, Slots: 16}, nil
 }
 
-func spinComplete(index int) (any, error) {
-	spinMu.Lock()
-	defer spinMu.Unlock()
-	if pendingSpin == nil || pendingSpin.Phase != "started" {
+func spinComplete(s *userSession, index int) (any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingSpin == nil || s.pendingSpin.Phase != "started" {
 		return nil, errors.New("완료할 SPIN이 없습니다. 먼저 SPIN을 시작해 주세요")
 	}
 	if index < 0 || index > 15 {
 		return nil, errors.New("SPIN 칸 번호가 올바르지 않습니다")
 	}
-	c, _, err := getSession()
+	c, _, err := getSession(s)
 	if err != nil {
 		return nil, err
 	}
@@ -659,18 +645,18 @@ func spinComplete(index int) (any, error) {
 	ctx, cancel := withTimeout(45 * time.Second)
 	defer cancel()
 	var results []*spinCollectionResult
-	spinID := pendingSpin.SpinID
+	spinID := s.pendingSpin.SpinID
 
 	// The successful capture's encrypted /spin/complete body is 64 bytes.
 	// {spinId,index} fits that framing, while the earlier selectedIndex guess
 	// does not. Send the user's single 0-based board choice once; never retry.
 	payload := map[string]any{"spinId": spinID, "index": index}
 	if err := doCosmoRequest(ctx, c, http.MethodPost, "/bff/v3/spin/complete", payload, true, &results); err != nil {
-		pendingSpin.Phase = "handoff-required"
+		s.pendingSpin.Phase = "handoff-required"
 		return nil, fmt.Errorf("SPIN 결과 확정 실패. 이 프로그램에서는 자동 재시도하지 않습니다. 공식 Cosmo 앱을 열면 진행 중인 SPIN을 이어서 완료할 수 있습니다: %w", err)
 	}
 	if len(results) != 16 {
-		pendingSpin.Phase = "handoff-required"
+		s.pendingSpin.Phase = "handoff-required"
 		return nil, fmt.Errorf("서버가 16칸이 아닌 %d칸을 반환했습니다. 이 프로그램에서는 자동 재시도하지 않습니다. 공식 Cosmo 앱에서 진행 중인 SPIN을 확인해 주세요", len(results))
 	}
 
@@ -692,7 +678,7 @@ func spinComplete(index int) (any, error) {
 		selected = card
 	}
 
-	pendingSpin = nil
+	s.pendingSpin = nil
 
 	var t spinTicketDTO
 	_ = doCosmoRequest(ctx, c, http.MethodGet, "/bff/v3/spin/tickets/tripleS", nil, false, &t)
@@ -706,18 +692,6 @@ func spinComplete(index int) (any, error) {
 	}, nil
 }
 
-func logout() (any, error) {
-	stateMu.Lock()
-	client = nil
-	signer = nil
-	currentAccount = nil
-	stateMu.Unlock()
-	spinMu.Lock()
-	pendingSpin = nil
-	spinMu.Unlock()
-	return map[string]bool{"ok": true}, nil
-}
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -725,13 +699,13 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func apiHandler(method string, fn func(*http.Request) (any, error)) http.HandlerFunc {
+func apiHandler(method string, fn func(http.ResponseWriter, *http.Request) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != method {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "허용되지 않은 요청입니다"})
 			return
 		}
-		result, err := fn(r)
+		result, err := fn(w, r)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
@@ -773,58 +747,105 @@ func main() {
 		log.Fatalf("site 폴더를 찾을 수 없습니다: %v", err)
 	}
 
+	sessions := newSessionStore()
+	requireSession := func(r *http.Request) (*userSession, error) {
+		session, ok := sessions.get(r)
+		if !ok {
+			return nil, errors.New("먼저 Cosmo 계정에 로그인해 주세요")
+		}
+		return session, nil
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/send-code", apiHandler(http.MethodPost, func(r *http.Request) (any, error) {
+	mux.HandleFunc("/api/send-code", apiHandler(http.MethodPost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req sendCodeRequest
 		if err := decode(r, &req); err != nil {
 			return nil, err
 		}
 		return sendCode(req.Email)
 	}))
-	mux.HandleFunc("/api/login", apiHandler(http.MethodPost, func(r *http.Request) (any, error) {
+	mux.HandleFunc("/api/login", apiHandler(http.MethodPost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req loginRequest
 		if err := decode(r, &req); err != nil {
 			return nil, err
 		}
-		return loginCosmo(req.Email, req.Code)
+		c, signer, account, err := loginCosmo(req.Email, req.Code)
+		if err != nil {
+			return nil, err
+		}
+		if err := sessions.create(r, w, c, signer, account); err != nil {
+			return nil, err
+		}
+		return account, nil
 	}))
-	mux.HandleFunc("/api/session", apiHandler(http.MethodGet, func(r *http.Request) (any, error) {
-		return sessionInfo()
+	mux.HandleFunc("/api/session", apiHandler(http.MethodGet, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		session, _ := sessions.get(r)
+		return sessionInfo(session), nil
 	}))
-	mux.HandleFunc("/api/collections", apiHandler(http.MethodGet, func(r *http.Request) (any, error) { return collections() }))
-	mux.HandleFunc("/api/search-users", apiHandler(http.MethodPost, func(r *http.Request) (any, error) {
+	mux.HandleFunc("/api/collections", apiHandler(http.MethodGet, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		session, err := requireSession(r)
+		if err != nil {
+			return nil, err
+		}
+		return collections(session)
+	}))
+	mux.HandleFunc("/api/search-users", apiHandler(http.MethodPost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req searchRequest
 		if err := decode(r, &req); err != nil {
 			return nil, err
 		}
-		return searchUsers(req.Query)
+		session, err := requireSession(r)
+		if err != nil {
+			return nil, err
+		}
+		return searchUsers(session, req.Query)
 	}))
-	mux.HandleFunc("/api/transfer", apiHandler(http.MethodPost, func(r *http.Request) (any, error) {
+	mux.HandleFunc("/api/transfer", apiHandler(http.MethodPost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req transferRequest
 		if err := decode(r, &req); err != nil {
 			return nil, err
 		}
-		return transfer(req.ObjektID, req.Recipient)
+		session, err := requireSession(r)
+		if err != nil {
+			return nil, err
+		}
+		return transfer(session, req.ObjektID, req.Recipient)
 	}))
-	mux.HandleFunc("/api/spin/status", apiHandler(http.MethodGet, func(r *http.Request) (any, error) {
-		return spinStatus()
+	mux.HandleFunc("/api/spin/status", apiHandler(http.MethodGet, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		session, err := requireSession(r)
+		if err != nil {
+			return nil, err
+		}
+		return spinStatus(session)
 	}))
-	mux.HandleFunc("/api/spin/start", apiHandler(http.MethodPost, func(r *http.Request) (any, error) {
+	mux.HandleFunc("/api/spin/start", apiHandler(http.MethodPost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req spinStartRequest
 		if err := decode(r, &req); err != nil {
 			return nil, err
 		}
-		return spinStart(req.ObjektID)
+		session, err := requireSession(r)
+		if err != nil {
+			return nil, err
+		}
+		return spinStart(session, req.ObjektID)
 	}))
-	mux.HandleFunc("/api/spin/complete", apiHandler(http.MethodPost, func(r *http.Request) (any, error) {
+	mux.HandleFunc("/api/spin/complete", apiHandler(http.MethodPost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req spinCompleteRequest
 		if err := decode(r, &req); err != nil {
 			return nil, err
 		}
-		return spinComplete(req.Index)
+		session, err := requireSession(r)
+		if err != nil {
+			return nil, err
+		}
+		return spinComplete(session, req.Index)
 	}))
-	mux.HandleFunc("/api/logout", apiHandler(http.MethodPost, func(r *http.Request) (any, error) { return logout() }))
-	mux.HandleFunc("/api/health", apiHandler(http.MethodGet, func(r *http.Request) (any, error) { return map[string]any{"ok": true, "mode": "native-local"}, nil }))
+	mux.HandleFunc("/api/logout", apiHandler(http.MethodPost, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		sessions.delete(r, w)
+		return map[string]bool{"ok": true}, nil
+	}))
+	mux.HandleFunc("/api/health", apiHandler(http.MethodGet, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		return map[string]any{"ok": true, "mode": "native-local"}, nil
+	}))
 
 	fs := http.FileServer(http.Dir(siteDir))
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
