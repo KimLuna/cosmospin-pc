@@ -5,6 +5,7 @@ const demoMode = new URLSearchParams(location.search).get('demo') === '1';
 const state = {
   bridge: null,
   account: null,
+  accountEmail: '',
   collections: [],
   expanded: new Set(),
   selected: new Map(), // objektId -> { copy, collection }
@@ -146,6 +147,220 @@ async function initLocalApp() {
   };
   setBridgeBadge('로컬 연결 완료', 'ready');
 }
+
+const SAVED_ACCOUNTS_KEY = 'cosmoSavedAccounts';
+const PENDING_ACCOUNT_EMAIL_KEY = 'cosmoPendingAccountEmail';
+
+function getSavedAccounts() {
+  try {
+    const raw = localStorage.getItem(SAVED_ACCOUNTS_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveSavedAccounts(list) {
+  try {
+    localStorage.setItem(SAVED_ACCOUNTS_KEY, JSON.stringify(list));
+  } catch {}
+}
+
+function findSavedEmail(account) {
+  if (!account) return '';
+  const address = String(account.address || account.eoa || '').toLowerCase();
+  const nickname = String(account.nickname || '');
+  const found = getSavedAccounts().find(item =>
+    (address && String(item.address || '').toLowerCase() === address) ||
+    (nickname && item.nickname === nickname)
+  );
+  return found?.email || '';
+}
+
+function saveAccountRecord(email, account) {
+  email = String(email || '').trim();
+  if (!email || !account) return;
+
+  const list = getSavedAccounts();
+  const normalized = email.toLowerCase();
+
+  const record = {
+    email,
+    nickname: account.nickname || 'Cosmo user',
+    address: account.address || account.eoa || '',
+    eoa: account.eoa || '',
+    updatedAt: Date.now(),
+  };
+
+  const idx = list.findIndex(item => String(item.email || '').toLowerCase() === normalized);
+  if (idx >= 0) list[idx] = {...list[idx], ...record};
+  else list.unshift(record);
+
+  list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  saveSavedAccounts(list.slice(0, 20));
+}
+
+function installAccountManager() {
+  const topActions = document.querySelector('.top-actions');
+  if (!topActions || document.getElementById('accountManagerBtn')) return;
+
+  const button = document.createElement('button');
+  button.id = 'accountManagerBtn';
+  button.type = 'button';
+  button.className = 'ghost';
+  button.textContent = '계정 관리';
+  topActions.insertBefore(button, els.logoutBtn);
+
+  const modal = document.createElement('div');
+  modal.id = 'accountManagerModal';
+  modal.className = 'modal-backdrop hidden';
+  modal.innerHTML = `
+    <div class="modal-card account-manager-card" role="dialog" aria-modal="true" aria-labelledby="accountManagerTitle">
+      <div class="modal-head">
+        <div>
+          <div class="eyebrow">ACCOUNT MANAGER</div>
+          <h2 id="accountManagerTitle">계정 관리</h2>
+        </div>
+        <button id="accountManagerClose" class="icon-btn" type="button" aria-label="닫기">×</button>
+      </div>
+
+      <div id="accountManagerList"></div>
+
+      <div class="account-manager-note">
+        계정 이메일만 이 브라우저에 저장합니다. 인증번호와 서명키는 저장하지 않습니다.
+      </div>
+
+      <div class="modal-actions">
+        <button id="accountManagerAdd" class="primary wide" type="button">＋ 새 계정 추가</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const style = document.createElement('style');
+  style.textContent = `
+    .account-manager-card { width:min(620px,100%); }
+    .account-manager-list { display:flex; flex-direction:column; gap:8px; }
+    .account-manager-item {
+      display:flex; align-items:center; justify-content:space-between; gap:12px;
+      padding:12px; border:1px solid var(--line); border-radius:12px; background:#0e0e13;
+    }
+    .account-manager-item.current {
+      border-color:rgba(166,255,0,.42);
+      box-shadow:0 0 0 1px rgba(166,255,0,.06);
+    }
+    .account-manager-main { min-width:0; }
+    .account-manager-main strong { display:block; color:var(--soft); font-size:13px; }
+    .account-manager-main .email { display:block; color:var(--muted); font-size:10px; margin-top:3px; overflow-wrap:anywhere; }
+    .account-manager-main code { display:block; color:var(--muted); font-size:9px; margin-top:3px; }
+    .account-manager-actions { display:flex; gap:6px; flex:0 0 auto; }
+    .account-manager-actions button { padding:7px 9px; font-size:10px; border-radius:8px; }
+    .account-manager-current {
+      display:inline-block; margin-left:6px; padding:3px 7px; border-radius:999px;
+      background:rgba(166,255,0,.08); color:var(--accent); font-size:8px; font-weight:900;
+    }
+    .account-manager-empty {
+      min-height:100px; display:grid; place-items:center; text-align:center;
+      border:1px dashed var(--line); border-radius:12px; color:var(--muted); padding:18px;
+    }
+    .account-manager-note {
+      margin-top:12px; padding:10px 12px; border:1px solid var(--line);
+      border-radius:10px; color:var(--muted); font-size:10px; line-height:1.5;
+    }
+  `;
+  document.head.appendChild(style);
+
+  button.addEventListener('click', () => {
+    renderAccountManager();
+    modal.classList.remove('hidden');
+  });
+
+  document.getElementById('accountManagerClose').addEventListener('click', () => {
+    modal.classList.add('hidden');
+  });
+
+  modal.addEventListener('click', async (e) => {
+    if (e.target === modal) {
+      modal.classList.add('hidden');
+      return;
+    }
+
+    const useBtn = e.target.closest('[data-account-use]');
+    if (useBtn) {
+      const email = useBtn.dataset.accountUse;
+      if (!email) return;
+
+      try { await state.bridge?.logout?.(); } catch {}
+      localStorage.setItem(PENDING_ACCOUNT_EMAIL_KEY, email);
+      location.reload();
+      return;
+    }
+
+    const deleteBtn = e.target.closest('[data-account-delete]');
+    if (deleteBtn) {
+      const email = deleteBtn.dataset.accountDelete;
+      const ok = window.confirm(`${email}\n\n이 브라우저의 저장된 계정 목록에서 삭제할까요?`);
+      if (!ok) return;
+
+      const next = getSavedAccounts().filter(
+        item => String(item.email || '').toLowerCase() !== String(email).toLowerCase()
+      );
+      saveSavedAccounts(next);
+      renderAccountManager();
+    }
+  });
+
+  document.getElementById('accountManagerAdd').addEventListener('click', async () => {
+    try { await state.bridge?.logout?.(); } catch {}
+    localStorage.removeItem(PENDING_ACCOUNT_EMAIL_KEY);
+    location.reload();
+  });
+}
+
+function renderAccountManager() {
+  const root = document.getElementById('accountManagerList');
+  if (!root) return;
+
+  const list = getSavedAccounts();
+  const currentEmail = String(state.accountEmail || '').toLowerCase();
+
+  if (!list.length) {
+    root.innerHTML = `
+      <div class="account-manager-empty">
+        아직 저장된 계정이 없습니다.<br>
+        로그인하면 이 브라우저에 계정이 자동으로 추가됩니다.
+      </div>
+    `;
+    return;
+  }
+
+  root.innerHTML = `
+    <div class="account-manager-list">
+      ${list.map(item => {
+        const email = String(item.email || '');
+        const current = email.toLowerCase() === currentEmail;
+        return `
+          <div class="account-manager-item ${current ? 'current' : ''}">
+            <div class="account-manager-main">
+              <strong>
+                ${esc(item.nickname || 'Cosmo user')}
+                ${current ? '<span class="account-manager-current">현재 계정</span>' : ''}
+              </strong>
+              <span class="email">${esc(email)}</span>
+              ${item.address ? `<code>${esc(shortAddr(item.address))}</code>` : ''}
+            </div>
+            <div class="account-manager-actions">
+              <button class="secondary" type="button" data-account-use="${esc(email)}">이 계정</button>
+              <button class="ghost" type="button" data-account-delete="${esc(email)}">삭제</button>
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
 function setBusy(button, busy, busyText) {
   if (!button.dataset.original) button.dataset.original = button.textContent;
   button.disabled = busy;
@@ -167,8 +382,9 @@ async function sendCode() {
   } finally { setBusy(els.sendCodeBtn, false); }
 }
 
-function applyAccountUI(account) {
+function applyAccountUI(account, email = '') {
   state.account = account;
+  state.accountEmail = email || findSavedEmail(account) || state.accountEmail;
   els.accountName.textContent = account?.nickname || 'Cosmo user';
   els.accountAddress.textContent = account?.address || account?.eoa || '-';
   els.loginView.classList.add('hidden');
@@ -181,7 +397,7 @@ async function restoreSession() {
   try {
     const session = await callBridge('session');
     if (!session?.authenticated || !session.account) return false;
-    applyAccountUI(session.account);
+    applyAccountUI(session.account, findSavedEmail(session.account));
     await loadCollections();
     await loadSpinStatus(true);
     return true;
@@ -198,7 +414,10 @@ async function login() {
   setLoginStatus('Cosmo 로그인 및 전송용 지갑을 준비하고 있습니다.');
   try {
     const account = await callBridge('login', email, code);
-    applyAccountUI(account);
+    state.accountEmail = email;
+    saveAccountRecord(email, account);
+    applyAccountUI(account, email);
+    renderAccountManager();
     await loadCollections();
     await loadSpinStatus(true);
   } catch (err) {
@@ -742,11 +961,25 @@ $$('[data-close]').forEach(btn => btn.addEventListener('click', () => $(`#${btn.
 
 (async () => {
   try {
+    installAccountManager();
+
+    const pendingEmail = (() => {
+      try { return localStorage.getItem(PENDING_ACCOUNT_EMAIL_KEY) || ''; }
+      catch { return ''; }
+    })();
+
+    if (pendingEmail) {
+      els.emailInput.value = pendingEmail;
+      try { localStorage.removeItem(PENDING_ACCOUNT_EMAIL_KEY); } catch {}
+      setLoginStatus('저장된 계정입니다. 인증번호를 받아 로그인하세요.');
+    }
+
     await initLocalApp();
     if (!demoMode) setBridgeBadge('로컬 연결 완료', 'ready');
     const restored = await restoreSession();
     if (restored) {
       if (!demoMode) setBridgeBadge('로그인 유지 · 로컬 연결 완료', 'ready');
+      renderAccountManager();
       let savedMode = 'transfer';
       try { savedMode = localStorage.getItem('cosmoToolMode') || 'transfer'; } catch {}
       if (state.spin.status?.pending || savedMode === 'spin') setMode('spin');
