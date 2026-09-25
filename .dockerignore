@@ -1,0 +1,13 @@
+.git
+.github
+.DS_Store
+.runtime/
+*.log
+*.exe
+*.test
+coverage.out
+bin/
+dist/
+tmp/
+.idea/
+.vscode/

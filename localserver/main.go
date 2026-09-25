@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -736,15 +737,72 @@ func openBrowser(target string) {
 	_ = cmd.Start()
 }
 
-func main() {
+func isServerMode() bool {
+	return strings.TrimSpace(os.Getenv("PORT")) != ""
+}
+
+func resolveListenAddress() (string, bool, error) {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		return "", false, nil
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", true, fmt.Errorf("PORT 값이 올바르지 않습니다: %q", port)
+	}
+	return net.JoinHostPort("0.0.0.0", strconv.Itoa(n)), true, nil
+}
+
+func resolveSiteDir() (string, error) {
 	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	workingDir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	var candidates []string
+	if isServerMode() {
+		candidates = []string{
+			filepath.Join(workingDir, "site"),
+			filepath.Join(filepath.Dir(exe), "site"),
+		}
+	} else {
+		candidates = []string{
+			filepath.Join(filepath.Dir(filepath.Dir(exe)), "site"),
+			filepath.Join(workingDir, "site"),
+		}
+	}
+
+	for _, candidate := range candidates {
+		if info, err := os.Stat(filepath.Join(candidate, "index.html")); err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("site/index.html을 찾을 수 없습니다")
+}
+
+func listenLocal() (net.Listener, string, error) {
+	for port := 8787; port <= 8797; port++ {
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, addr, nil
+		}
+	}
+	return nil, "", errors.New("실행할 포트를 찾지 못했습니다. 이미 실행 중인 창이 있는지 확인해 주세요.")
+}
+
+func main() {
+	serverAddr, serverMode, err := resolveListenAddress()
 	if err != nil {
 		log.Fatal(err)
 	}
-	root := filepath.Dir(filepath.Dir(exe))
-	siteDir := filepath.Join(root, "site")
-	if _, err := os.Stat(filepath.Join(siteDir, "index.html")); err != nil {
-		log.Fatalf("site 폴더를 찾을 수 없습니다: %v", err)
+	siteDir, err := resolveSiteDir()
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	sessions := newSessionStore()
@@ -844,7 +902,11 @@ func main() {
 		return map[string]bool{"ok": true}, nil
 	}))
 	mux.HandleFunc("/api/health", apiHandler(http.MethodGet, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return map[string]any{"ok": true, "mode": "native-local"}, nil
+		mode := "local"
+		if serverMode {
+			mode = "server"
+		}
+		return map[string]any{"ok": true, "mode": mode}, nil
 	}))
 
 	fs := http.FileServer(http.Dir(siteDir))
@@ -857,32 +919,44 @@ func main() {
 
 	var ln net.Listener
 	var addr string
-	for port := 8787; port <= 8797; port++ {
-		addr = fmt.Sprintf("127.0.0.1:%d", port)
-		ln, err = net.Listen("tcp", addr)
-		if err == nil {
-			break
-		}
+	if serverMode {
+		ln, err = net.Listen("tcp", serverAddr)
+		addr = serverAddr
+	} else {
+		ln, addr, err = listenLocal()
 	}
-	if ln == nil {
-		log.Fatal("실행할 포트를 찾지 못했습니다. 이미 실행 중인 창이 있는지 확인해 주세요.")
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	target := "http://" + addr + "/"
 	fmt.Println("====================================================")
 	fmt.Println(" tripleS Cosmo Tool v4 + SPIN")
 	fmt.Println("====================================================")
 	fmt.Println()
-	fmt.Println("브라우저에서 프로그램을 열었습니다:")
-	fmt.Println(target)
-	fmt.Println()
-	fmt.Println("로그인/조회/전송은 이 PC에서 직접 처리됩니다.")
-	fmt.Println("이 검은 창은 프로그램 실행 중에 그대로 두세요.")
-	fmt.Println("사용을 끝내려면 이 창을 닫으면 됩니다.")
+	if serverMode {
+		fmt.Printf("server mode: 요청을 %s에서 수신합니다.\n", addr)
+	} else {
+		target := "http://" + addr + "/"
+		fmt.Println("local mode: 브라우저에서 프로그램을 엽니다:")
+		fmt.Println(target)
+		fmt.Println()
+		fmt.Println("로그인/조회/전송은 이 PC에서 직접 처리됩니다.")
+		fmt.Println("이 검은 창은 프로그램 실행 중에 그대로 두세요.")
+		fmt.Println("사용을 끝내려면 이 창을 닫으면 됩니다.")
+		go func() {
+			time.Sleep(600 * time.Millisecond)
+			openBrowser(target)
+		}()
+	}
 	fmt.Println()
 
-	go func() { time.Sleep(600 * time.Millisecond); openBrowser(target) }()
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 15 * time.Second}
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+
 	if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

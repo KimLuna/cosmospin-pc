@@ -5,13 +5,17 @@ import (
 	"encoding/base64"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"codeberg.org/djvu/cosmo-tui/internal/cosmo"
 	"codeberg.org/djvu/cosmo-tui/internal/wallet"
 )
 
 const sessionCookieName = "cosmo_session"
+
+const sessionLifetime = 12 * time.Hour
 
 // userSession keeps all authenticated COSMO state private to one browser session.
 // mu serializes transfer and SPIN operations for that user and protects pendingSpin.
@@ -22,6 +26,7 @@ type userSession struct {
 	signer         *wallet.Wallet
 	currentAccount *accountResult
 	pendingSpin    *spinSession
+	expiresAt      time.Time
 }
 
 type sessionStore struct {
@@ -39,8 +44,10 @@ func (s *sessionStore) create(r *http.Request, w http.ResponseWriter, client *co
 		return err
 	}
 
+	now := time.Now()
 	accountCopy := account
 	s.mu.Lock()
+	s.cleanupExpiredLocked(now)
 	if oldID := sessionIDFromRequest(r); oldID != "" {
 		delete(s.sessions, oldID)
 	}
@@ -48,6 +55,7 @@ func (s *sessionStore) create(r *http.Request, w http.ResponseWriter, client *co
 		client:         client,
 		signer:         signer,
 		currentAccount: &accountCopy,
+		expiresAt:      now.Add(sessionLifetime),
 	}
 	s.mu.Unlock()
 
@@ -57,6 +65,9 @@ func (s *sessionStore) create(r *http.Request, w http.ResponseWriter, client *co
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   secureCookieForRequest(r),
+		MaxAge:   int(sessionLifetime.Seconds()),
+		Expires:  now.Add(sessionLifetime),
 	})
 	return nil
 }
@@ -66,9 +77,10 @@ func (s *sessionStore) get(r *http.Request) (*userSession, bool) {
 	if id == "" {
 		return nil, false
 	}
-	s.mu.RLock()
+	s.mu.Lock()
+	s.cleanupExpiredLocked(time.Now())
 	session, ok := s.sessions[id]
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	return session, ok
 }
 
@@ -84,8 +96,32 @@ func (s *sessionStore) delete(r *http.Request, w http.ResponseWriter) {
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   secureCookieForRequest(r),
 		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
 	})
+}
+
+func (s *sessionStore) cleanupExpired(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupExpiredLocked(now)
+}
+
+func (s *sessionStore) cleanupExpiredLocked(now time.Time) {
+	for id, session := range s.sessions {
+		if !session.expiresAt.After(now) {
+			delete(s.sessions, id)
+		}
+	}
+}
+
+func secureCookieForRequest(r *http.Request) bool {
+	if isServerMode() || r.TLS != nil {
+		return true
+	}
+	parts := strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")
+	return strings.EqualFold(strings.TrimSpace(parts[0]), "https")
 }
 
 func sessionIDFromRequest(r *http.Request) string {
