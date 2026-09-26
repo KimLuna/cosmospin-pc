@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"math/big"
 	"strings"
 	"time"
@@ -26,9 +27,6 @@ import (
 	"codeberg.org/djvu/cosmo-tui/internal/wallet"
 )
 
-// RPC is the slice of the Cosmo client Send needs: the sponsored-gas parameters,
-// and the JSON-RPC calls that price a transaction and carry it. *cosmo.Client
-// satisfies it; narrowing it keeps Send testable without an HTTP client.
 type RPC interface {
 	GasStationAbstract(ctx context.Context) (cosmo.AbstractGas, error)
 	AbstractNonce(ctx context.Context, addr string) (uint64, error)
@@ -36,20 +34,12 @@ type RPC interface {
 	AbstractSendRawTx(ctx context.Context, rawHex string) (string, error)
 }
 
-// ReceiptReader is the receipt read AwaitReceipt polls.
 type ReceiptReader interface {
 	AbstractTxState(ctx context.Context, hash string) (cosmo.AbstractReceipt, error)
 }
 
-// gasLimitFallback is used when eth_estimateGas fails; comfortably above an
-// observed transferFrom cost. A 20% margin is added to whichever value is used.
 const gasLimitFallback = 400000
 
-// Send signs and broadcasts a sponsored transfer from the user's AGW account to
-// the contract at to, carrying data, and returns the transaction hash.
-//
-// A returned hash means the transaction is on the wire, not that it did
-// anything: pass it to AwaitReceipt to find out.
 func Send(ctx context.Context, c RPC, w *wallet.Wallet, from, to wallet.Address, data []byte) (string, error) {
 	paymaster, err := wallet.ParseAddress(cosmo.AbstractPaymaster)
 	if err != nil {
@@ -57,24 +47,31 @@ func Send(ctx context.Context, c RPC, w *wallet.Wallet, from, to wallet.Address,
 	}
 	gas, err := c.GasStationAbstract(ctx)
 	if err != nil {
+		log.Printf("[CHAIN] stage=gas-station-error error=%v", err)
 		return "", fmt.Errorf("gas station: %w", err)
 	}
+	log.Printf("[CHAIN] stage=gas-station-ok standard=%d paymasterInputPresent=%t", gas.Standard, strings.TrimSpace(gas.PaymasterInput) != "")
 	paymasterInput, err := decodeHex(gas.PaymasterInput)
 	if err != nil {
+		log.Printf("[CHAIN] stage=paymaster-input-error error=%v", err)
 		return "", fmt.Errorf("paymaster input: %w", err)
 	}
-	// From the latest block, so the transaction has to be mined before the next
-	// one is signed or the two would reuse a nonce.
 	nonce, err := c.AbstractNonce(ctx, from.Hex())
 	if err != nil {
+		log.Printf("[CHAIN] stage=nonce-error error=%v", err)
 		return "", fmt.Errorf("nonce: %w", err)
 	}
+	log.Printf("[CHAIN] stage=nonce-ok nonce=%d", nonce)
 
 	gasLimit, err := c.AbstractEstimateGas(ctx, from.Hex(), to.Hex(), "0x"+hex.EncodeToString(data))
 	if err != nil {
+		log.Printf("[CHAIN] stage=estimate-gas-fallback fallback=%d error=%v", gasLimitFallback, err)
 		gasLimit = gasLimitFallback
+	} else {
+		log.Printf("[CHAIN] stage=estimate-gas-ok estimated=%d", gasLimit)
 	}
-	gasLimit += gasLimit / 5 // safety margin
+	gasLimit += gasLimit / 5
+	log.Printf("[CHAIN] stage=gas-limit final=%d", gasLimit)
 
 	raw, err := w.SignTransfer(wallet.TransferParams{
 		ChainID:              big.NewInt(cosmo.AbstractChainID),
@@ -91,58 +88,65 @@ func Send(ctx context.Context, c RPC, w *wallet.Wallet, from, to wallet.Address,
 		PaymasterInput:       paymasterInput,
 	})
 	if err != nil {
+		log.Printf("[CHAIN] stage=sign-error error=%v", err)
 		return "", fmt.Errorf("sign: %w", err)
 	}
-	return c.AbstractSendRawTx(ctx, "0x"+hex.EncodeToString(raw))
+	hash, err := c.AbstractSendRawTx(ctx, "0x"+hex.EncodeToString(raw))
+	if err != nil {
+		log.Printf("[CHAIN] stage=broadcast-error error=%v", err)
+		return "", err
+	}
+	log.Printf("[CHAIN] stage=broadcast-ok txHash=%s", hash)
+	return hash, nil
 }
 
-// Receipt polling cadence. Variables so tests can run the loop without the waits.
 var (
 	PollInterval = 1500 * time.Millisecond
-	PollTries    = 20 // ≈30s
+	PollTries    = 20
 )
 
-// Proof is what a broadcast transaction has to be seen doing before it counts as
-// having happened, plus how to say so when it does not. Moved reads the receipt's
-// logs — the only trustworthy evidence, since a transaction can mine successfully
-// having moved nothing and a state read lags the receipt. Reverted and Unproven
-// are the caller's wording for the two ways that goes wrong.
 type Proof struct {
 	Moved    func(cosmo.AbstractReceipt) bool
-	Reverted error // the transaction reverted on-chain
-	Unproven error // it was mined, and its logs do not show the move
+	Reverted error
+	Unproven error
 }
 
-// AwaitReceipt waits for a broadcast transaction to be mined and reports whether
-// its receipt proves p. A transaction that never surfaces within the polling
-// budget is (false, nil): broadcast, unconfirmed, not a failure — the one thing
-// this must never do is claim something landed that was not seen to.
 func AwaitReceipt(ctx context.Context, c ReceiptReader, hash string, p Proof) (bool, error) {
+	var lastRPCError error
 	for i := 0; i < PollTries; i++ {
 		time.Sleep(PollInterval)
 		rec, err := c.AbstractTxState(ctx, hash)
 		switch {
 		case err != nil:
-			continue // a transient RPC hiccup; the transaction itself is still live
+			lastRPCError = err
+			if i == 0 || i == PollTries-1 {
+				log.Printf("[CHAIN] stage=receipt-rpc-error txHash=%s try=%d error=%v", hash, i+1, err)
+			}
+			continue
 		case rec.Status == cosmo.TxReverted:
+			log.Printf("[CHAIN] stage=receipt-reverted txHash=%s try=%d", hash, i+1)
 			return false, p.Reverted
 		case rec.Status != cosmo.TxSuccess:
-			continue // not mined yet
+			continue
 		case p.Moved(rec):
+			log.Printf("[CHAIN] stage=receipt-proven txHash=%s try=%d logs=%d", hash, i+1, len(rec.Logs))
 			return true, nil
 		case len(rec.Logs) == 0:
-			// A receipt with no logs at all is not something this chain produces
-			// (the gas payment alone logs), so treat it as a proxy that strips
-			// them rather than as proof of a no-op.
+			log.Printf("[CHAIN] stage=receipt-success-no-logs txHash=%s try=%d", hash, i+1)
 			return false, nil
 		default:
+			log.Printf("[CHAIN] stage=receipt-unproven txHash=%s try=%d logs=%d", hash, i+1, len(rec.Logs))
 			return false, p.Unproven
 		}
 	}
-	return false, nil // broadcast, but no receipt yet
+	if lastRPCError != nil {
+		log.Printf("[CHAIN] stage=receipt-timeout txHash=%s lastRPCError=%v", hash, lastRPCError)
+	} else {
+		log.Printf("[CHAIN] stage=receipt-timeout txHash=%s", hash)
+	}
+	return false, nil
 }
 
-// decodeHex parses 0x-prefixed (or bare) hex into bytes.
 func decodeHex(s string) ([]byte, error) {
 	return hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X"))
 }
